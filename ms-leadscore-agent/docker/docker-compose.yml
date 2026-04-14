@@ -1,0 +1,55 @@
+version: '3.8'
+
+services:
+  lead-scoring-api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: lead-scoring-api
+    ports:
+      - "8000:8000"
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+      - REDIS_HOST=redis
+    env_file:
+      - ../.env
+    depends_on:
+      - ollama
+      - redis
+    networks:
+      - lead-scoring-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    networks:
+      - lead-scoring-network
+    restart: unless-stopped
+    command: serve
+
+  redis:
+    image: redis:7-alpine
+    container_name: lead-scoring-redis
+    ports:
+      - "6379:6379"
+    networks:
+      - lead-scoring-network
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+
+networks:
+  lead-scoring-network:
+    driver: bridge
+
+volumes:
+  ollama_data:

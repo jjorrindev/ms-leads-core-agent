@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+pydantic>=2.5.0,<3.0.0
+google-adk
+python-dotenv
+httpx
+redis>=5.0.0
+prometheus-fastapi-instrumentator
+python-multipart
+tenacity
+pytest
+pytest-asyncio
+pytest-cov
