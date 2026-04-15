@@ -1,7 +1,8 @@
+import asyncio
 import json
 import logging
 import re
-from typing import Dict, List, Optional
+from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
 from datetime import datetime
 from dotenv import load_dotenv
@@ -18,20 +19,32 @@ logger = logging.getLogger(__name__)
 @dataclass
 class LeadEvaluation:
     """Estructura para almacenar la evaluación del lead"""
-    score_total: int
+    # Campos sin valor por defecto (obligatorios)
     nivel: str
     desglose: Dict[str, int]
     ajustes: Dict[str, int]
     interpretacion: str
     proxima_accion: str
     frases_clave_detectadas: List[str]
+    score_total: int
+    
+    # Campos con valor por defecto (opcionales) - deben ir al final
+    score_actual: Optional[int] = None
+    score_final: Optional[int] = None
 
 class LeadScoringAgent:
-    """Agente especializado en calificación de leads"""
+    """Agente especializado en calificación de leads - Versión que fuerza uso de IA"""
     
-    def __init__(self):
+    def __init__(self, force_ia: bool = True):
+        """
+        Inicializa el agente
+        
+        Args:
+            force_ia: Si es True, fuerza el uso del agente IA y no usa fallback
+        """
         self.modelo = "phi3:mini"
         self.api_base = "http://localhost:11434"
+        self.force_ia = force_ia  # Forzar uso de IA
         
         self.evaluador = self._crear_agente_evaluador()
         
@@ -44,9 +57,10 @@ class LeadScoringAgent:
         )
         
         self.keywords = self._cargar_keywords()
+        logger.info(f"LeadScoringAgent inicializado con force_ia={self.force_ia}")
     
     def _cargar_keywords(self) -> Dict:
-        """Carga palabras clave para análisis rápido"""
+        """Carga palabras clave para análisis rápido (solo usado si force_ia=False)"""
         return {
             "interes_alto": ["precio", "costo", "disponibilidad", "cuánto cuesta", "interesado", "quiero", "necesito"],
             "urgencia_alta": ["urgente", "hoy", "mañana", "esta semana", "inmediato", "cuanto antes"],
@@ -145,20 +159,52 @@ Asegúrate de que el JSON sea válido y no incluir texto adicional fuera del JSO
             description="Experto en calificación de leads conversacionales",
         )
     
-    async def evaluar_conversacion(self, conversacion: str) -> LeadEvaluation:
-        """Evalúa una conversación y devuelve la puntuación del lead"""
+    async def evaluar_conversacion(self, conversacion: str, score_actual: int = None, metadata: Dict = None) -> LeadEvaluation:
+        """
+        Evalúa una conversación usando el agente IA.
+        
+        Si force_ia=True, no usa fallback y lanza excepción si hay error.
+        Si force_ia=False, usa fallback por keywords si es necesario.
+        """
         try:
+            # Validar conversación
             if not conversacion or len(conversacion.strip()) < 10:
-                return self._evaluacion_fallback("Conversación demasiado corta o vacía")
+                error_msg = f"Conversación demasiado corta o vacía (longitud: {len(conversacion) if conversacion else 0})"
+                logger.error(error_msg)
+                if self.force_ia:
+                    raise ValueError(error_msg)
+                return self._evaluacion_fallback(error_msg, score_actual)
             
-            prompt = f"""
+            # Construir prompt incluyendo el score actual si existe
+            prompt_base = f"""
 ## CONVERSACIÓN A ANALIZAR
 
 {conversacion}
+"""
+            
+            # Agregar metadata al prompt si existe
+            if metadata:
+                prompt_base += f"\n## METADATA DE LA CONVERSACIÓN\n"
+                for key, value in metadata.items():
+                    if value:
+                        prompt_base += f"- {key}: {value}\n"
+            
+            if score_actual is not None:
+                prompt_base += f"""
+
+## CONTEXTO ADICIONAL
+El lead tiene un puntaje actual de {score_actual}/100.
+Por favor, considera este puntaje existente junto con el análisis de la nueva conversación
+para determinar el puntaje total final. El puntaje final debe ser un promedio ponderado
+que combine el puntaje histórico con la nueva evaluación (60% nueva evaluación, 40% puntaje histórico).
+"""
+            
+            prompt_base += """
 
 Analiza esta conversación y devuelve el JSON con la evaluación.
 """
             
+            logger.info("Creando sesión para el agente IA...")
             session = await self.session_service.create_session(
                 app_name=self.app_name,
                 user_id="evaluador",
@@ -167,9 +213,10 @@ Analiza esta conversación y devuelve el JSON con la evaluación.
             
             user_content = types.Content(
                 role="user",
-                parts=[types.Part.from_text(text=prompt)]
+                parts=[types.Part.from_text(text=prompt_base)]
             )
             
+            logger.info("Ejecutando agente IA...")
             respuesta_texto = ""
             async for event in self.runner.run_async(
                 user_id="evaluador",
@@ -184,57 +231,101 @@ Analiza esta conversación y devuelve el JSON con la evaluación.
                 if event.is_final_response():
                     break
             
-            evaluacion = self._parsear_respuesta(respuesta_texto)
+            logger.info(f"Respuesta del agente IA recibida (longitud: {len(respuesta_texto)} caracteres)")
+            
+            # Parsear respuesta
+            evaluacion = self._parsear_respuesta(respuesta_texto, score_actual)
             
             if not evaluacion:
-                logger.warning("Falló parseo de JSON, usando método de respaldo")
-                evaluacion = self._evaluacion_fallback_con_analisis(conversacion)
+                error_msg = "No se pudo parsear la respuesta del agente IA"
+                logger.error(error_msg)
+                logger.error(f"Respuesta recibida: {respuesta_texto[:500]}...")
+                
+                if self.force_ia:
+                    raise ValueError(error_msg)
+                else:
+                    logger.warning("Usando método de respaldo por keywords")
+                    evaluacion = self._evaluacion_fallback_con_analisis(conversacion, score_actual)
             
             return evaluacion
             
         except Exception as e:
-            logger.error(f"Error en evaluación: {e}")
-            return self._evaluacion_fallback(f"Error: {str(e)}")
+            logger.error(f"Error en evaluación con IA: {e}")
+            if self.force_ia:
+                # Relanzar el error para que sea visible
+                raise Exception(f"Error del agente IA: {str(e)}. Verifica que Ollama esté corriendo y el modelo phi3:mini esté disponible.")
+            else:
+                logger.warning("Usando método de respaldo por error")
+                return self._evaluacion_fallback(f"Error: {str(e)}", score_actual)
     
-    def _parsear_respuesta(self, texto: str) -> Optional[LeadEvaluation]:
+    def _parsear_respuesta(self, texto: str, score_actual: int = None) -> LeadEvaluation:
         """Extrae y parsea el JSON de la respuesta del agente"""
         try:
-            # Extraer el bloque JSON más externo de forma robusta
-            start = texto.find('{')
-            end = texto.rfind('}') + 1
-            if start != -1 and end > start:
-                data = json.loads(texto[start:end])
-                
-                score_total = self._safe_int(data.get("score_total", 0))
-                
-                desglose_raw = data.get("desglose", {})
-                desglose = {
-                    key: self._safe_int(value) 
-                    for key, value in desglose_raw.items()
-                }
-                
-                for key in ["interes_explicito", "urgencia", "presupuesto_autoridad", 
-                           "calidad_respuestas", "senales_compra"]:
-                    if key not in desglose:
-                        desglose[key] = 0
-                
-                ajustes_raw = data.get("ajustes", {})
-                ajustes = {
-                    key: self._safe_int(value)
-                    for key, value in ajustes_raw.items()
-                }
-                
-                return LeadEvaluation(
-                    score_total=score_total,
-                    nivel=str(data.get("nivel", "MUY_BAJO")),
-                    desglose=desglose,
-                    ajustes=ajustes,
-                    interpretacion=str(data.get("interpretacion", "")),
-                    proxima_accion=str(data.get("proxima_accion", "")),
-                    frases_clave_detectadas=data.get("frases_clave_detectadas", [])
-                )
+            # Buscar JSON en la respuesta
+            json_match = re.search(r'\{.*\}', texto, re.DOTALL)
+            if not json_match:
+                logger.error("No se encontró JSON en la respuesta")
+                return None
+            
+            data = json.loads(json_match.group())
+            
+            score_nuevo = self._safe_int(data.get("score_total", 0))
+            
+            # Calcular score final considerando score_actual
+            score_final = score_nuevo
+            if score_actual is not None:
+                # 60% nueva evaluación, 40% score histórico
+                score_final = int((score_nuevo * 0.6) + (score_actual * 0.4))
+                score_final = max(0, min(100, score_final))
+            
+            desglose_raw = data.get("desglose", {})
+            desglose = {
+                key: self._safe_int(value) 
+                for key, value in desglose_raw.items()
+            }
+            
+            # Asegurar que todas las claves existan
+            for key in ["interes_explicito", "urgencia", "presupuesto_autoridad", 
+                       "calidad_respuestas", "senales_compra"]:
+                if key not in desglose:
+                    desglose[key] = 0
+            
+            ajustes_raw = data.get("ajustes", {})
+            ajustes = {
+                key: self._safe_int(value)
+                for key, value in ajustes_raw.items()
+            }
+            
+            # Determinar nivel basado en score_final
+            if score_final >= 70:
+                nivel = "ALTO"
+            elif score_final >= 50:
+                nivel = "MEDIO"
+            elif score_final >= 25:
+                nivel = "BAJO"
+            else:
+                nivel = "MUY_BAJO"
+            
+            interpretacion = str(data.get("interpretacion", ""))
+            # Marcar que esta evaluación proviene del agente IA
+            if not interpretacion.startswith("[IA]"):
+                interpretacion = f"[IA] {interpretacion}"
+            
+            return LeadEvaluation(
+                score_total=score_nuevo,
+                nivel=nivel,
+                desglose=desglose,
+                ajustes=ajustes,
+                interpretacion=interpretacion,
+                proxima_accion=str(data.get("proxima_accion", "")),
+                frases_clave_detectadas=data.get("frases_clave_detectadas", []),
+                score_actual=score_actual,
+                score_final=score_final
+            )
+            
         except json.JSONDecodeError as e:
             logger.error(f"Error parseando JSON: {e}")
+            logger.error(f"Texto que causó error: {texto[:200]}...")
         except Exception as e:
             logger.error(f"Error procesando evaluación: {e}")
         return None
@@ -248,15 +339,14 @@ Analiza esta conversación y devuelve el JSON con la evaluación.
                 return int(value)
             if isinstance(value, str):
                 cleaned = re.sub(r'[^\d-]', '', value)
-                if cleaned and cleaned != '-':
-                    return int(cleaned)
-                return default
+                return int(cleaned) if cleaned else default
             return default
         except (ValueError, TypeError):
             return default
     
-    def _evaluacion_fallback(self, error_msg: str) -> LeadEvaluation:
-        """Evaluación de respaldo cuando hay error"""
+    def _evaluacion_fallback(self, error_msg: str, score_actual: int = None) -> LeadEvaluation:
+        """Evaluación de respaldo cuando hay error (solo usado si force_ia=False)"""
+        score_final = score_actual if score_actual is not None else 0
         return LeadEvaluation(
             score_total=0,
             nivel="ERROR",
@@ -268,23 +358,30 @@ Analiza esta conversación y devuelve el JSON con la evaluación.
                 "senales_compra": 0
             },
             ajustes={"penalizaciones": 0, "bonificaciones": 0},
-            interpretacion=f"Error en análisis: {error_msg}",
-            proxima_accion="Revisar la conversación manualmente",
-            frases_clave_detectadas=[]
+            interpretacion=f"[FALLBACK] Error en análisis: {error_msg}",
+            proxima_accion="Revisar la conversación manualmente y verificar conexión con Ollama",
+            frases_clave_detectadas=[],
+            score_actual=score_actual,
+            score_final=score_final
         )
     
-    def _evaluacion_fallback_con_analisis(self, conversacion: str) -> LeadEvaluation:
-        """Evaluación de respaldo usando análisis de keywords"""
+    def _evaluacion_fallback_con_analisis(self, conversacion: str, score_actual: int = None) -> LeadEvaluation:
+        """Evaluación de respaldo usando análisis de keywords (solo usado si force_ia=False)"""
         conversacion_lower = conversacion.lower()
         
         score = 0
         desglose = {k: 0 for k in ["interes_explicito", "urgencia", "presupuesto_autoridad", 
                                     "calidad_respuestas", "senales_compra"]}
         
+        # Análisis de interés
         if any(kw in conversacion_lower for kw in self.keywords["interes_alto"]):
             desglose["interes_explicito"] = 20
             score += 20
+        elif any(kw in conversacion_lower for kw in ["tal vez", "quizás", "puede ser"]):
+            desglose["interes_explicito"] = 10
+            score += 10
         
+        # Análisis de urgencia
         if any(kw in conversacion_lower for kw in self.keywords["urgencia_alta"]):
             desglose["urgencia"] = 20
             score += 20
@@ -292,15 +389,25 @@ Analiza esta conversación y devuelve el JSON con la evaluación.
             desglose["urgencia"] = 15
             score += 15
         
+        # Análisis de autoridad y presupuesto
         if any(kw in conversacion_lower for kw in self.keywords["autoridad"]):
-            desglose["presupuesto_autoridad"] = 20
-            score += 20
+            if any(kw in conversacion_lower for kw in ["presupuesto", "$", "dólares", "euros"]):
+                desglose["presupuesto_autoridad"] = 20
+                score += 20
+            else:
+                desglose["presupuesto_autoridad"] = 15
+                score += 15
+        elif any(kw in conversacion_lower for kw in ["presupuesto", "$", "dólares", "euros"]):
+            desglose["presupuesto_autoridad"] = 10
+            score += 10
         
+        # Análisis de señales de compra
         if any(kw in conversacion_lower for kw in self.keywords["senales_compra"]):
             desglose["senales_compra"] = 20
             score += 20
         
-        lineas_lead = [l for l in conversacion.split('\n') if l.startswith("LEAD")]
+        # Calidad de respuestas (aproximado por longitud)
+        lineas_lead = [l for l in conversacion.split('\n') if l.upper().startswith("LEAD")]
         if lineas_lead:
             longitud_promedio = sum(len(l) for l in lineas_lead) / len(lineas_lead)
             if longitud_promedio > 100:
@@ -316,36 +423,54 @@ Analiza esta conversación y devuelve el JSON con la evaluación.
                 desglose["calidad_respuestas"] = 5
                 score += 5
         
+        # Penalizaciones
         penalizaciones = 0
         if any(kw in conversacion_lower for kw in self.keywords["objeciones"]):
             penalizaciones += 10
         
+        # Contar mensajes del vendedor sin respuesta
+        lineas_vendedor = [l for l in conversacion.split('\n') if l.upper().startswith("VENDEDOR")]
+        if len(lineas_vendedor) > 3:
+            penalizaciones += 15
+        
+        # Bonificaciones
         bonificaciones = 0
         if any(kw in conversacion_lower for kw in self.keywords["entusiasmo"]):
             bonificaciones += 5
         
-        if conversacion.strip().startswith("LEAD"):
+        # Bonus si el lead inicia la conversación
+        if conversacion.strip().upper().startswith("LEAD"):
             bonificaciones += 10
         
-        score_total = max(0, min(100, score - penalizaciones + bonificaciones))
+        # Calcular score nuevo
+        score_nuevo = max(0, min(100, score - penalizaciones + bonificaciones))
         
-        if score_total >= 70:
+        # Calcular score final considerando score_actual
+        score_final = score_nuevo
+        if score_actual is not None:
+            score_final = int((score_nuevo * 0.6) + (score_actual * 0.4))
+            score_final = max(0, min(100, score_final))
+        
+        # Determinar nivel
+        if score_final >= 70:
             nivel = "ALTO"
-        elif score_total >= 50:
+        elif score_final >= 50:
             nivel = "MEDIO"
-        elif score_total >= 25:
+        elif score_final >= 25:
             nivel = "BAJO"
         else:
             nivel = "MUY_BAJO"
         
         return LeadEvaluation(
-            score_total=score_total,
+            score_total=score_nuevo,
             nivel=nivel,
             desglose=desglose,
             ajustes={"penalizaciones": penalizaciones, "bonificaciones": bonificaciones},
-            interpretacion=f"Evaluación automática por keywords. Score: {score_total}",
+            interpretacion=f"[FALLBACK-KEYWORDS] Evaluación automática por keywords. Score nuevo: {score_nuevo}, Score final: {score_final}",
             proxima_accion=self._recomendar_accion(nivel),
-            frases_clave_detectadas=self._detectar_frases_clave(conversacion)
+            frases_clave_detectadas=self._detectar_frases_clave(conversacion),
+            score_actual=score_actual,
+            score_final=score_final
         )
     
     def _detectar_frases_clave(self, conversacion: str) -> List[str]:
@@ -355,7 +480,7 @@ Analiza esta conversación y devuelve el JSON con la evaluación.
             for palabra in palabras:
                 if palabra.lower() in conversacion.lower():
                     frases.append(palabra)
-        return list(set(frases))[:10]
+        return list(set(frases[:10]))
     
     def _recomendar_accion(self, nivel: str) -> str:
         """Recomienda acción según el nivel del lead"""
@@ -364,6 +489,6 @@ Analiza esta conversación y devuelve el JSON con la evaluación.
             "MEDIO": "📊 Lead tibio - Enviar más información y agendar llamada",
             "BAJO": "📧 Lead frío - Nutrir con newsletter, no priorizar",
             "MUY_BAJO": "⏸️ Lead descartado - No invertir más tiempo",
-            "ERROR": "⚠️ Revisar manualmente la conversación"
+            "ERROR": "⚠️ Revisar manualmente la conversación y verificar conexión con Ollama"
         }
         return acciones.get(nivel, acciones["MUY_BAJO"])
